@@ -57,6 +57,7 @@ class MainActivity : ComponentActivity() {
     private var urlInput by mutableStateOf("https://sitruyencv.com")
     private var canGoBack by mutableStateOf(false)
     private var canGoForward by mutableStateOf(false)
+    private var showHistory by mutableStateOf(false)
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(className: ComponentName, service: IBinder) {
@@ -134,6 +135,14 @@ class MainActivity : ComponentActivity() {
                 isPlaying = false
             }
         }
+
+        @JavascriptInterface
+        fun saveHistory(storyId: String, storyName: String, chapterName: String, url: String) {
+            runOnUiThread {
+                val historyManager = HistoryManager(this@MainActivity)
+                historyManager.saveHistoryItem(storyId, storyName, chapterName, url)
+            }
+        }
     }
 
     private val requestPermissionLauncher = registerForActivityResult(
@@ -182,6 +191,9 @@ class MainActivity : ComponentActivity() {
                                     )
                                 },
                                 actions = {
+                                    IconButton(onClick = { showHistory = true }) {
+                                        Text("🕒")
+                                    }
                                     IconButton(onClick = { webViewInstance?.reload() }) {
                                         Text("🔄")
                                     }
@@ -216,6 +228,41 @@ class MainActivity : ComponentActivity() {
                                 canGoForward = forward
                             }
                         )
+                        
+                        if (showHistory) {
+                            ModalBottomSheet(
+                                onDismissRequest = { showHistory = false }
+                            ) {
+                                Column(modifier = Modifier.padding(16.dp).fillMaxWidth().height(400.dp)) {
+                                    Text("Lịch sử Đọc Truyện", style = MaterialTheme.typography.titleLarge)
+                                    Spacer(modifier = Modifier.height(16.dp))
+                                    val historyManager = remember { HistoryManager(this@MainActivity) }
+                                    val historyList = remember { historyManager.getHistory() }
+                                    
+                                    if (historyList.isEmpty()) {
+                                        Text("Chưa có lịch sử đọc.")
+                                    } else {
+                                        LazyColumn {
+                                            items(historyList) { item ->
+                                                Card(
+                                                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable {
+                                                        showHistory = false
+                                                        currentUrl = item.url
+                                                        urlInput = item.url
+                                                        webViewInstance?.loadUrl(item.url)
+                                                    }
+                                                ) {
+                                                    Column(modifier = Modifier.padding(12.dp)) {
+                                                        Text(item.storyName, style = MaterialTheme.typography.titleMedium)
+                                                        Text(item.chapterName, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         
                         if (showSettings) {
                             ModalBottomSheet(
@@ -598,6 +645,51 @@ fun WebViewScreen(url: String, activity: MainActivity, onUrlChanged: (String) ->
                                     }
                                 }, 1000);
                                 // --- KẾT THÚC: TỰ ĐỘNG HÓA WEB PLAYER ---
+                                // --- BẮT ĐẦU: LƯU LỊCH SỬ ---
+                                setTimeout(function() {
+                                    try {
+                                        let url = window.location.href;
+                                        if (url.includes('/read/')) {
+                                            // Extract storyId
+                                            let m = url.match(/\/read\/(\d+)/);
+                                            let storyId = m ? m[1] : "";
+                                            
+                                            // Extract chapter name (usually in h1 or h2 with class text-2xl or similar, containing "Chương")
+                                            let chapterName = "";
+                                            let headings = document.querySelectorAll('h1, h2, h3');
+                                            for(let h of headings) {
+                                                if (h.innerText && h.innerText.toLowerCase().includes('chương')) {
+                                                    chapterName = h.innerText.trim();
+                                                    break;
+                                                }
+                                            }
+                                            
+                                            // Extract story name (usually in breadcrumb or <title>)
+                                            let storyName = "";
+                                            let title = document.title || "";
+                                            // "Chương 3: ... - Tên Truyện"
+                                            if (title.includes('-')) {
+                                                let parts = title.split('-');
+                                                storyName = parts[parts.length - 1].trim();
+                                            }
+                                            // Try breadcrumb
+                                            let as = document.querySelectorAll('a');
+                                            for(let a of as) {
+                                                if (a.href && a.href.includes('/truyen/') && a.innerText) {
+                                                    storyName = a.innerText.trim();
+                                                    break;
+                                                }
+                                            }
+                                            
+                                            if (storyId && storyName && chapterName) {
+                                                if (window.AndroidTTS && window.AndroidTTS.saveHistory) {
+                                                    window.AndroidTTS.saveHistory(storyId, storyName, chapterName, url);
+                                                }
+                                            }
+                                        }
+                                    } catch(e) {}
+                                }, 3000); // Đợi 3s cho web load xong
+                                // --- KẾT THÚC: LƯU LỊCH SỬ ---
                             })();
                         """.trimIndent()
                         view?.evaluateJavascript(js, null)
