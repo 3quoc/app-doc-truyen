@@ -53,8 +53,8 @@ class MainActivity : ComponentActivity() {
     private var selectedVoice by mutableStateOf<Voice?>(null)
 
     // Browser state
-    private var currentUrl by mutableStateOf("https://sitruyencv.com")
-    private var urlInput by mutableStateOf("https://sitruyencv.com")
+    private var currentUrl by mutableStateOf("https://sitruyencv.com/read/18700/1?v=18301")
+    private var urlInput by mutableStateOf("https://sitruyencv.com/read/18700/1?v=18301")
     private var canGoBack by mutableStateOf(false)
     private var canGoForward by mutableStateOf(false)
     private var showHistory by mutableStateOf(false)
@@ -70,7 +70,14 @@ class MainActivity : ComponentActivity() {
 
             audioService?.onSpeechComplete = {
                 runOnUiThread {
-                    webViewInstance?.evaluateJavascript("if(window.goToNextChapterAndRead) window.goToNextChapterAndRead();", null)
+                    // Set the pending autoread flag FIRST (persists through full-page navigation)
+                    // then call goToNextChapterAndRead which may trigger window.location.href change
+                    webViewInstance?.evaluateJavascript("""
+                        localStorage.setItem('sitruyen_pending_autoread', 'true');
+                        if(window.goToNextChapterAndRead) {
+                            window.goToNextChapterAndRead();
+                        }
+                    """.trimIndent(), null)
                 }
             }
             
@@ -457,89 +464,156 @@ fun WebViewScreen(url: String, activity: MainActivity, onUrlChanged: (String) ->
                 };
 
                 window.goToNextChapterAndRead = function() {
-                    let els = document.querySelectorAll("a, button, div.btn, span.btn, .next");
+                    console.log('[AutoNext] goToNextChapterAndRead called');
+                    let els = document.querySelectorAll("a, button, div.btn, span.btn, .next, [class*='next'], [class*='btn-next']");
                     let candidates = [];
                     for(let i=0; i<els.length; i++) {
                         let el = els[i];
                         let txt = el.innerText ? el.innerText.trim().toLowerCase() : "";
                         let className = typeof el.className === "string" ? el.className.toLowerCase() : "";
+                        let ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+                        let title = (el.getAttribute('title') || '').toLowerCase();
+                        let href = el.getAttribute('href') || '';
                         
                         let isNext = false;
-                        if (txt === "chương sau" || txt === "chương tiếp" || txt === "next" || txt === "chương sau >" || txt.includes("chương sau") || txt.includes("chương tiếp")) {
+                        if (txt === "chương sau" || txt === "chương tiếp" || txt === "next" || txt === "chương sau >" || txt.includes("chương sau") || txt.includes("chương tiếp") || txt.includes("tiếp theo") || txt === "sau" || txt === "tiếp") {
                             isNext = true;
                         }
                         
-                        if (txt === ">" || txt === ">>" || txt === "›" || txt === "»" || txt === "→") {
+                        if (ariaLabel.includes('next') || ariaLabel.includes('chương sau') || title.includes('next') || title.includes('chương sau')) {
+                            isNext = true;
+                        }
+                        
+                        if (txt === ">" || txt === ">>" || txt === "›" || txt === "»" || txt === "→" || txt === "❯") {
                             let offsetTop = el.getBoundingClientRect().top + window.scrollY;
                             if (offsetTop > 500 || className.includes("next") || className.includes("btn")) {
                                 isNext = true;
                             }
                         }
                         
-                        if (className.includes("next") && !className.includes("prev")) {
+                        // Xóa className.includes("right") vì dễ nhầm với các class CSS như text-right, right-0
+                        if (className.includes("next") && !className.includes("prev") && !className.includes("left")) {
                             isNext = true;
                         }
                         
-                        if (isNext) candidates.push(el);
+                        if (isNext) {
+                            console.log('[AutoNext] Found candidate: tag=' + el.tagName + ', text=' + txt + ', href=' + (el.href || 'none'));
+                            candidates.push(el);
+                        }
                     }
                     
-                    candidates.sort((a, b) => {
-                        return (b.getBoundingClientRect().top + window.scrollY) - (a.getBoundingClientRect().top + window.scrollY);
-                    });
-                    
-                    let nextBtn = candidates[0];
-
-                    if (nextBtn) {
-                        let oldText = document.body.innerText;
+                    if (candidates.length > 0) {
+                        // Ưu tiên các thẻ có href chứa 'chuong', 'chapter'
+                        let strongCandidates = candidates.filter(el => {
+                            let h = (el.getAttribute('href') || '').toLowerCase();
+                            return h && (h.includes('chuong') || h.includes('chapter') || h.includes('chap') || h.includes('read'));
+                        });
+                        
+                        let listToSort = strongCandidates.length > 0 ? strongCandidates : candidates;
+                        
+                        listToSort.sort((a, b) => {
+                            return (b.getBoundingClientRect().top + window.scrollY) - (a.getBoundingClientRect().top + window.scrollY);
+                        });
+                        
+                        let nextBtn = listToSort[0];
+                        console.log('[AutoNext] Using button: tag=' + nextBtn.tagName + ', text=' + (nextBtn.innerText || '').trim() + ', href=' + (nextBtn.href || 'none'));
+                        
+                        // Set flag so the NEW page knows to auto-read after loading
+                        localStorage.setItem('sitruyen_pending_autoread', 'true');
+                        
                         if (nextBtn.href && nextBtn.href.startsWith("http")) {
                             window.location.href = nextBtn.href;
                         } else {
                             nextBtn.click();
+                            let oldText = document.body.innerText;
+                            let attempts = 0;
+                            let checkInterval = setInterval(function() {
+                                attempts++;
+                                if (document.body.innerText !== oldText || attempts > 30) {
+                                    clearInterval(checkInterval);
+                                    localStorage.removeItem('sitruyen_pending_autoread');
+                                    setTimeout(() => window.startTTSReading(), 1500);
+                                }
+                            }, 500);
                         }
-                        
-                        let attempts = 0;
-                        let checkInterval = setInterval(function() {
-                            attempts++;
-                            if (document.body.innerText !== oldText || attempts > 20) {
-                                clearInterval(checkInterval);
-                                setTimeout(() => window.startTTSReading(), 1500);
-                            }
-                        }, 500);
                     } else {
-                        // Fallback: Auto-increment the last number in the URL
+                        // Fallback: Smart increment chapter in URL
+                        console.log('[AutoNext] No next button found, trying URL increment fallback');
                         let url = window.location.href;
                         try {
                             let urlObj = new URL(url);
                             let path = urlObj.pathname;
-                            let match = path.match(/(\d+)(?!.*\d)/);
+                            
+                            // Thử tìm mẫu chuong-123
+                            let match = path.match(/(chuong|chapter|chap|tap|c)[-/_](\d+)/i);
                             if (match) {
-                                let oldNumStr = match[1];
+                                let oldNumStr = match[2];
                                 let newNum = parseInt(oldNumStr) + 1;
-                                let newPath = path.substring(0, match.index) + newNum + path.substring(match.index + oldNumStr.length);
+                                let prefix = path.substring(0, match.index + match[1].length + 1); // +1 cho dấu - hoặc _
+                                let suffix = path.substring(match.index + match[0].length);
+                                let newPath = prefix + newNum + suffix;
                                 urlObj.pathname = newPath;
+                                console.log('[AutoNext] URL smart increment: ' + urlObj.toString());
+                                localStorage.setItem('sitruyen_pending_autoread', 'true');
                                 window.location.href = urlObj.toString();
-                                
-                                let oldText = document.body.innerText;
-                                let attempts = 0;
-                                let checkInterval = setInterval(function() {
-                                    attempts++;
-                                    if (document.body.innerText !== oldText || attempts > 20) {
-                                        clearInterval(checkInterval);
-                                        setTimeout(() => window.startTTSReading(), 1500);
-                                    }
-                                }, 500);
                             } else {
-                                AndroidTTS.notifyNoNextChapter();
+                                // Fallback cơ bản tìm số cuối cùng
+                                let fallbackMatch = path.match(/(\d+)(?!.*\d)/);
+                                if (fallbackMatch) {
+                                    let oldNumStr = fallbackMatch[1];
+                                    let newNum = parseInt(oldNumStr) + 1;
+                                    let newPath = path.substring(0, fallbackMatch.index) + newNum + path.substring(fallbackMatch.index + oldNumStr.length);
+                                    urlObj.pathname = newPath;
+                                    console.log('[AutoNext] URL fallback increment: ' + urlObj.toString());
+                                    localStorage.setItem('sitruyen_pending_autoread', 'true');
+                                    window.location.href = urlObj.toString();
+                                } else {
+                                    console.log('[AutoNext] No number in URL to increment');
+                                    if (window.AndroidTTS && window.AndroidTTS.notifyNoNextChapter) {
+                                        window.AndroidTTS.notifyNoNextChapter();
+                                    }
+                                }
                             }
                         } catch(e) {
-                            // Ignore
+                            console.error('[AutoNext] URL increment error:', e);
                         }
                     }
                 };
                 
+                // --- BẮT ĐẦU: CHECK PENDING AUTO-READ (after full-page navigation) ---
+                (function() {
+                    let pendingAutoRead = localStorage.getItem('sitruyen_pending_autoread');
+                    if (pendingAutoRead === 'true') {
+                        console.log('[AutoNext] Detected pending autoread flag on new page');
+                        localStorage.removeItem('sitruyen_pending_autoread');
+                        // Retry startTTSReading multiple times in case DOM isn't ready yet
+                        let autoReadAttempts = 0;
+                        let autoReadInterval = setInterval(function() {
+                            autoReadAttempts++;
+                            console.log('[AutoNext] Auto-read attempt ' + autoReadAttempts);
+                            try {
+                                if (window.startTTSReading) {
+                                    window.startTTSReading();
+                                    clearInterval(autoReadInterval);
+                                    console.log('[AutoNext] Auto-read started successfully');
+                                } else if (autoReadAttempts > 15) {
+                                    clearInterval(autoReadInterval);
+                                    console.log('[AutoNext] Auto-read gave up after 15 attempts');
+                                }
+                            } catch(e) {
+                                console.error('[AutoNext] Auto-read error:', e);
+                                if (autoReadAttempts > 15) clearInterval(autoReadInterval);
+                            }
+                        }, 1000);
+                    }
+                })();
+                // --- KẾT THÚC: CHECK PENDING AUTO-READ ---
+
                 // --- BẮT ĐẦU: TỰ ĐỘNG HÓA WEB PLAYER ---
+                // Always reset these on each injection to avoid stale state
                 window.webPlayerTransitioning = false;
                 window.playerStatusContainer = null;
+                console.log('[WebPlayer] Player automation initialized/reset');
                 let userDelayMs = 2000;
 
                 function nativeClick(el) {
@@ -555,7 +629,10 @@ fun WebViewScreen(url: String, activity: MainActivity, onUrlChanged: (String) ->
                 }
 
                 setInterval(function() {
-                    if (window.webPlayerTransitioning) return;
+                    if (window.webPlayerTransitioning) {
+                        console.log('[WebPlayer] Skipping poll - transitioning');
+                        return;
+                    }
                     
                     if (!window.playerStatusContainer || !document.body.contains(window.playerStatusContainer)) {
                         let walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
@@ -577,8 +654,34 @@ fun WebViewScreen(url: String, activity: MainActivity, onUrlChanged: (String) ->
                         let stickyDiv = document.querySelector('div.sticky.top-0.z-50');
                         if (stickyDiv) {
                             let svgs = stickyDiv.querySelectorAll('svg');
-                            if (svgs.length >= 3) {
-                                nativeClick(svgs[2]);
+                            let targetSvg = null;
+                            
+                            // 1. Cố gắng tìm nút nghe dựa trên HTML hoặc class
+                            for (let i = 0; i < svgs.length; i++) {
+                                let svg = svgs[i];
+                                let html = svg.outerHTML.toLowerCase();
+                                let parentHtml = svg.parentElement ? svg.parentElement.outerHTML.toLowerCase() : "";
+                                
+                                if (html.includes('volume') || html.includes('speaker') || html.includes('audio') || html.includes('sound') || 
+                                    parentHtml.includes('nghe') || parentHtml.includes('đọc') || parentHtml.includes('audio') || parentHtml.includes('play')) {
+                                    targetSvg = svg;
+                                    break;
+                                }
+                            }
+                            
+                            // 2. Fallback thông minh dựa trên số lượng icon
+                            if (!targetSvg && svgs.length > 0) {
+                                if (svgs.length >= 4) {
+                                    targetSvg = svgs[2]; // Thường là: Home, Book (Menu), Speaker, Gear
+                                } else if (svgs.length === 3) {
+                                    targetSvg = svgs[1]; // Thường là: Home, Speaker, Gear (khi không có Book)
+                                } else {
+                                    targetSvg = svgs[svgs.length - 1]; // Đoán mò
+                                }
+                            }
+                            
+                            if (targetSvg) {
+                                nativeClick(targetSvg);
                                 localStorage.setItem('sitruyen_autoplay_step', 'click_play');
                             }
                         }
@@ -591,7 +694,24 @@ fun WebViewScreen(url: String, activity: MainActivity, onUrlChanged: (String) ->
                                     if(!container) break;
                                     let svgs = container.querySelectorAll('svg');
                                     if(svgs.length >= 3) {
-                                        let targetSvg = svgs[2] || svgs[1];
+                                        let targetSvg = null;
+                                        
+                                        // Tìm SVG đóng vai trò nút Play
+                                        for(let j=0; j<svgs.length; j++) {
+                                            let svg = svgs[j];
+                                            let html = svg.outerHTML.toLowerCase();
+                                            let parentHtml = svg.parentElement ? svg.parentElement.outerHTML.toLowerCase() : "";
+                                            if (html.includes('play') || parentHtml.includes('play')) {
+                                                targetSvg = svg;
+                                                break;
+                                            }
+                                        }
+                                        
+                                        // Fallback như cũ nếu không tìm thấy
+                                        if (!targetSvg) {
+                                            targetSvg = svgs[2] || svgs[1];
+                                        }
+                                        
                                         if (targetSvg) {
                                             nativeClick(targetSvg);
                                             localStorage.removeItem('sitruyen_autoplay_step');
@@ -622,11 +742,15 @@ fun WebViewScreen(url: String, activity: MainActivity, onUrlChanged: (String) ->
                         }
                         
                         if (isFinished) {
+                            console.log('[WebPlayer] Chapter finished! Transitioning to next chapter...');
                             window.webPlayerTransitioning = true;
                             setTimeout(function() {
                                 localStorage.setItem('sitruyen_autoplay_step', 'open_player');
                                 if (window.goToNextChapterAndRead) {
                                     window.goToNextChapterAndRead();
+                                } else {
+                                    console.log('[WebPlayer] goToNextChapterAndRead not available, resetting transition flag');
+                                    window.webPlayerTransitioning = false;
                                 }
                             }, userDelayMs);
                         }
@@ -805,7 +929,18 @@ fun WebViewScreen(url: String, activity: MainActivity, onUrlChanged: (String) ->
                     setInterval(processHistory, 1500);
                     setTimeout(processHistory, 500);
                     setInterval(function() {
-                        console.log("[TestJS] Current URL: " + window.location.href + " | Title: " + document.title + " | Injected: " + window.historyJSInjected);
+                        let sticky = document.querySelector('div.sticky.top-0.z-50');
+                        let svgsCount = sticky ? sticky.querySelectorAll('svg').length : 0;
+                        let autoplayStep = localStorage.getItem('sitruyen_autoplay_step');
+                        let pendingAutoread = localStorage.getItem('sitruyen_pending_autoread');
+                        let statusText = window.playerStatusContainer ? (window.playerStatusContainer.innerText || "") : "not_found";
+                        console.log("[TestJS] URL: " + window.location.href + 
+                                    " | sticky: " + (sticky !== null) + 
+                                    " | svgs: " + svgsCount + 
+                                    " | autoplayStep: " + autoplayStep + 
+                                    " | pendingAutoread: " + pendingAutoread + 
+                                    " | statusText: " + statusText +
+                                    " | transitioning: " + window.webPlayerTransitioning);
                     }, 2000);
                     window.historyJSInjected = true;
                 })();
