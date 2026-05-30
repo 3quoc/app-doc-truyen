@@ -138,10 +138,19 @@ class MainActivity : ComponentActivity() {
 
         @JavascriptInterface
         fun saveHistory(storyId: String, storyName: String, chapterName: String, url: String) {
+            android.util.Log.d("AndroidTTS", "saveHistory: storyId=$storyId, storyName=$storyName, chapter=$chapterName, url=$url")
             runOnUiThread {
                 val historyManager = HistoryManager(this@MainActivity)
                 historyManager.saveHistoryItem(storyId, storyName, chapterName, url)
             }
+        }
+
+        @JavascriptInterface
+        fun getSavedChapterUrl(storyId: String, storyName: String): String {
+            val historyManager = HistoryManager(this@MainActivity)
+            val res = historyManager.getSavedChapterUrl(storyId, storyName) ?: ""
+            android.util.Log.d("AndroidTTS", "getSavedChapterUrl: storyId=$storyId, storyName=$storyName -> res=$res")
+            return res
         }
     }
 
@@ -219,6 +228,9 @@ class MainActivity : ComponentActivity() {
                     // Removed native FABs to use web player automation
                 ) { innerPadding ->
                     Box(modifier = Modifier.padding(innerPadding).fillMaxSize()) {
+                        androidx.activity.compose.BackHandler(enabled = canGoBack) {
+                            webViewInstance?.goBack()
+                        }
                         WebViewScreen(
                             url = currentUrl,
                             activity = this@MainActivity,
@@ -347,6 +359,464 @@ class MainActivity : ComponentActivity() {
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun WebViewScreen(url: String, activity: MainActivity, onUrlChanged: (String) -> Unit, onNavStateChanged: (Boolean, Boolean) -> Unit) {
+    fun injectHistoryJS(view: WebView?) {
+        val js = """
+            javascript:(function() {
+                if (window.historyJSInjected) return;
+                let style = document.createElement("style");
+                style.innerHTML = ".tts-highlight { background-color: #ffff99 !important; color: black !important; border-radius: 4px; } .tts-clickable { cursor: pointer; }";
+                (document.head || document.documentElement || document.body).appendChild(style);
+
+                window.startTTSReading = function() {
+                    function findMainContentContainer() {
+                        let current = document.body;
+                        while (current) {
+                            let maxChild = null;
+                            let maxLen = 0;
+                            for (let i = 0; i < current.children.length; i++) {
+                                let child = current.children[i];
+                                let len = child.innerText ? child.innerText.length : 0;
+                                if (len > maxLen) {
+                                    maxLen = len;
+                                    maxChild = child;
+                                }
+                            }
+                            let parentLen = current.innerText ? current.innerText.length : 0;
+                            if (maxChild && maxLen > parentLen * 0.8 && maxLen > 500) {
+                                current = maxChild;
+                            } else {
+                                return current;
+                            }
+                        }
+                        return document.body;
+                    }
+
+                    let contentDiv = findMainContentContainer();
+                    
+                    if (contentDiv) {
+                        // Wrap loose text nodes
+                        let childNodes = Array.from(contentDiv.childNodes);
+                        for (let i = 0; i < childNodes.length; i++) {
+                            let node = childNodes[i];
+                            if (node.nodeType === Node.TEXT_NODE) {
+                                let text = node.textContent.trim();
+                                if (text.length > 10) {
+                                    let span = document.createElement("span");
+                                    span.textContent = text;
+                                    span.style.display = "block";
+                                    contentDiv.insertBefore(span, node);
+                                    contentDiv.removeChild(node);
+                                }
+                            }
+                        }
+
+                        let elements = contentDiv.children;
+                        let textArr = [];
+                        let pIndex = 0;
+                        
+                        for (let i = 0; i < elements.length; i++) {
+                            let el = elements[i];
+                            let text = el.innerText ? el.innerText.trim() : "";
+                            // Ignore nav/header elements
+                            if (el.tagName === "NAV" || el.tagName === "HEADER" || el.tagName === "SCRIPT" || el.tagName === "STYLE" || el.tagName === "A" || el.tagName === "BUTTON") continue;
+                            
+                            if (text.length > 15) {
+                                textArr.push(text + ". ");
+                                
+                                if (!el.classList.contains("tts-clickable")) {
+                                    el.classList.add("tts-clickable");
+                                    el.setAttribute("data-tts-index", pIndex);
+                                    let clickHandler = function(e) {
+                                        AndroidTTS.playFromIndex(parseInt(this.getAttribute("data-tts-index")));
+                                        e.stopPropagation();
+                                    };
+                                    el.addEventListener("click", clickHandler, true);
+                                    el.addEventListener("touchend", clickHandler, true);
+                                }
+                                pIndex++;
+                            }
+                        }
+                        
+                        if (textArr.length > 0) {
+                            AndroidTTS.receiveParagraphs(JSON.stringify(textArr));
+                        }
+                    }
+                };
+
+                window.highlightParagraph = function(index) {
+                    let els = document.querySelectorAll(".tts-highlight");
+                    for (let i=0; i<els.length; i++) {
+                        els[i].classList.remove("tts-highlight");
+                    }
+                    
+                    let target = document.querySelector('[data-tts-index="' + index + '"]');
+                    if (target) {
+                        target.classList.add("tts-highlight");
+                        target.scrollIntoView({ behavior: "smooth", block: "center" });
+                    }
+                };
+
+                window.goToNextChapterAndRead = function() {
+                    let els = document.querySelectorAll("a, button, div.btn, span.btn, .next");
+                    let candidates = [];
+                    for(let i=0; i<els.length; i++) {
+                        let el = els[i];
+                        let txt = el.innerText ? el.innerText.trim().toLowerCase() : "";
+                        let className = typeof el.className === "string" ? el.className.toLowerCase() : "";
+                        
+                        let isNext = false;
+                        if (txt === "chương sau" || txt === "chương tiếp" || txt === "next" || txt === "chương sau >" || txt.includes("chương sau") || txt.includes("chương tiếp")) {
+                            isNext = true;
+                        }
+                        
+                        if (txt === ">" || txt === ">>" || txt === "›" || txt === "»" || txt === "→") {
+                            let offsetTop = el.getBoundingClientRect().top + window.scrollY;
+                            if (offsetTop > 500 || className.includes("next") || className.includes("btn")) {
+                                isNext = true;
+                            }
+                        }
+                        
+                        if (className.includes("next") && !className.includes("prev")) {
+                            isNext = true;
+                        }
+                        
+                        if (isNext) candidates.push(el);
+                    }
+                    
+                    candidates.sort((a, b) => {
+                        return (b.getBoundingClientRect().top + window.scrollY) - (a.getBoundingClientRect().top + window.scrollY);
+                    });
+                    
+                    let nextBtn = candidates[0];
+
+                    if (nextBtn) {
+                        let oldText = document.body.innerText;
+                        if (nextBtn.href && nextBtn.href.startsWith("http")) {
+                            window.location.href = nextBtn.href;
+                        } else {
+                            nextBtn.click();
+                        }
+                        
+                        let attempts = 0;
+                        let checkInterval = setInterval(function() {
+                            attempts++;
+                            if (document.body.innerText !== oldText || attempts > 20) {
+                                clearInterval(checkInterval);
+                                setTimeout(() => window.startTTSReading(), 1500);
+                            }
+                        }, 500);
+                    } else {
+                        // Fallback: Auto-increment the last number in the URL
+                        let url = window.location.href;
+                        try {
+                            let urlObj = new URL(url);
+                            let path = urlObj.pathname;
+                            let match = path.match(/(\d+)(?!.*\d)/);
+                            if (match) {
+                                let oldNumStr = match[1];
+                                let newNum = parseInt(oldNumStr) + 1;
+                                let newPath = path.substring(0, match.index) + newNum + path.substring(match.index + oldNumStr.length);
+                                urlObj.pathname = newPath;
+                                window.location.href = urlObj.toString();
+                                
+                                let oldText = document.body.innerText;
+                                let attempts = 0;
+                                let checkInterval = setInterval(function() {
+                                    attempts++;
+                                    if (document.body.innerText !== oldText || attempts > 20) {
+                                        clearInterval(checkInterval);
+                                        setTimeout(() => window.startTTSReading(), 1500);
+                                    }
+                                }, 500);
+                            } else {
+                                AndroidTTS.notifyNoNextChapter();
+                            }
+                        } catch(e) {
+                            // Ignore
+                        }
+                    }
+                };
+                
+                // --- BẮT ĐẦU: TỰ ĐỘNG HÓA WEB PLAYER ---
+                window.webPlayerTransitioning = false;
+                window.playerStatusContainer = null;
+                let userDelayMs = 2000;
+
+                function nativeClick(el) {
+                    let rect = el.getBoundingClientRect();
+                    let x = rect.left + rect.width / 2;
+                    let y = rect.top + rect.height / 2;
+                    if (window.AndroidTTS && window.AndroidTTS.simulateClick) {
+                        window.AndroidTTS.simulateClick(x, y);
+                    } else {
+                        el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                        if (el.parentElement) el.parentElement.click();
+                    }
+                }
+
+                setInterval(function() {
+                    if (window.webPlayerTransitioning) return;
+                    
+                    if (!window.playerStatusContainer || !document.body.contains(window.playerStatusContainer)) {
+                        let walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+                        let node;
+                        while (node = walker.nextNode()) {
+                            if (node.nodeValue.match(/Đoạn\s*\d+\s*\/\s*\d+/i) || node.nodeValue === 'Kết thúc' || node.nodeValue === 'Tạm dừng') {
+                                let parentText = node.parentElement.innerText || "";
+                                if (parentText.includes('Đoạn') || parentText.includes('Kết thúc') || parentText.includes('Tạm dừng')) {
+                                    window.playerStatusContainer = node.parentElement;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    
+                    let autoplayStep = localStorage.getItem('sitruyen_autoplay_step');
+                    
+                    if (autoplayStep === 'open_player') {
+                        let stickyDiv = document.querySelector('div.sticky.top-0.z-50');
+                        if (stickyDiv) {
+                            let svgs = stickyDiv.querySelectorAll('svg');
+                            if (svgs.length >= 3) {
+                                nativeClick(svgs[2]);
+                                localStorage.setItem('sitruyen_autoplay_step', 'click_play');
+                            }
+                        }
+                    } else if (autoplayStep === 'click_play') {
+                        if (window.playerStatusContainer) {
+                            let statusText = window.playerStatusContainer.innerText || "";
+                            if (statusText.includes("Tạm dừng")) {
+                                let container = window.playerStatusContainer.parentElement;
+                                for(let i=0; i<6; i++) {
+                                    if(!container) break;
+                                    let svgs = container.querySelectorAll('svg');
+                                    if(svgs.length >= 3) {
+                                        let targetSvg = svgs[2] || svgs[1];
+                                        if (targetSvg) {
+                                            nativeClick(targetSvg);
+                                            localStorage.removeItem('sitruyen_autoplay_step');
+                                        }
+                                        break;
+                                    }
+                                    container = container.parentElement;
+                                }
+                            } else if (statusText.includes("Đang đọc") || statusText.includes("Đoạn")) {
+                                // Already playing or preparing
+                                localStorage.removeItem('sitruyen_autoplay_step');
+                            }
+                        }
+                    }
+                    
+                    if (window.playerStatusContainer) {
+                        let statusText = window.playerStatusContainer.innerText || "";
+                        let isPaused = statusText.includes("Tạm dừng");
+                        let isFinished = statusText.includes("Kết thúc");
+                        
+                        let m = statusText.match(/Đoạn\s*(\d+)\s*\/\s*(\d+)/i);
+                        if (m) {
+                            let current = parseInt(m[1]);
+                            let total = parseInt(m[2]);
+                            if (current === total && total > 0 && isPaused) {
+                                isFinished = true;
+                            }
+                        }
+                        
+                        if (isFinished) {
+                            window.webPlayerTransitioning = true;
+                            setTimeout(function() {
+                                localStorage.setItem('sitruyen_autoplay_step', 'open_player');
+                                if (window.goToNextChapterAndRead) {
+                                    window.goToNextChapterAndRead();
+                                }
+                            }, userDelayMs);
+                        }
+                    }
+                }, 1000);
+                // --- KẾT THÚC: TỰ ĐỘNG HÓA WEB PLAYER ---
+                
+                // --- BẮT ĐẦU: LƯU VÀ PHỤC HỒI LỊCH SỬ ---
+                (function() {
+                    let lastProcessedUrl = "";
+                    
+                    function getCleanStoryName() {
+                        // 1. Thu thập từ thẻ h1
+                        let headings = document.querySelectorAll('h1');
+                        for (let h of headings) {
+                            let txt = h.innerText ? h.innerText.trim() : "";
+                            if (txt && txt.length > 0 && !/^(chương|chapter|chap|tập|c)\s+\d+/i.test(txt)) {
+                                let lower = txt.toLowerCase();
+                                if (lower.includes("không tìm thấy trang") || 
+                                    lower.includes("trang không tồn tại") || 
+                                    lower.includes("loading") || 
+                                    lower === "si truyện cv" || 
+                                    lower === "truyentv" || 
+                                    lower === "truyện cv" || 
+                                    lower === "truyện chữ") {
+                                    continue;
+                                }
+                                return txt;
+                            }
+                        }
+                        
+                        // 2. Thu thập từ link trỏ về trang chi tiết truyện (hữu ích cho trang đọc chương)
+                        let links = document.querySelectorAll('a');
+                        for (let a of links) {
+                            let href = a.getAttribute('href') || '';
+                            let txt = a.innerText ? a.innerText.trim() : '';
+                            if (txt && txt.length > 0 && href !== '/truyen' && href !== '/story' && !href.startsWith('#')) {
+                                if (/\/story\/\d+($|\?)/.test(href) || (/\/truyen\/[^/]+($|\?)/.test(href) && !href.includes('/read/') && !href.includes('/chuong-'))) {
+                                    let lower = txt.toLowerCase();
+                                    if (lower.includes("không tìm thấy trang") || 
+                                        lower.includes("trang không tồn tại") || 
+                                        lower.includes("loading") || 
+                                        lower === "si truyện cv" || 
+                                        lower === "truyentv" || 
+                                        lower === "truyện cv" || 
+                                        lower === "truyện chữ" ||
+                                        lower.includes("chương") ||
+                                        lower.includes("chapter") ||
+                                        lower.includes("đọc từ đầu") ||
+                                        lower.includes("đọc tiếp")) {
+                                        continue;
+                                    }
+                                    return txt;
+                                }
+                            }
+                        }
+                        
+                        // 3. Phân tích từ document.title
+                        let title = document.title || "";
+                        let parts = title.split(/\s*(?:\|| - |- )\s*/);
+                        
+                        for (let part of parts) {
+                            let cleanPart = part.trim();
+                            let lower = cleanPart.toLowerCase();
+                            if (!cleanPart) continue;
+                            if (lower.includes("không tìm thấy trang") || 
+                                lower.includes("trang không tồn tại") || 
+                                lower.includes("loading") || 
+                                lower === "si truyện cv" || 
+                                lower === "truyentv" || 
+                                lower === "truyện cv" || 
+                                lower === "truyện chữ") {
+                                continue;
+                            }
+                            if (/^(chương|chapter|chap|tập|c)\s+\d+/i.test(cleanPart)) continue;
+                            return cleanPart;
+                        }
+                        return "";
+                    }
+                    
+                    function processHistory() {
+                        try {
+                            let url = window.location.href;
+                            
+                            // 1. Phân tích trang hiện tại
+                            let isChapter = false;
+                            let storyUrl = "";
+                            let chapterName = "";
+                            let chapterRegex = /\/(chuong|chapter|chap|read|tap|c)[-/_](\d+)/i;
+                            
+                            let idMatch = url.match(/\/(story|read|truyen)\/(\d+)/i);
+                            if (idMatch) {
+                                storyUrl = window.location.origin + "/story/" + idMatch[2];
+                                if (url.includes('/read/') || /\/(chuong|chapter|chap|tap|c)[-/_]/i.test(url)) {
+                                    isChapter = true;
+                                }
+                            } else {
+                                let match = url.match(chapterRegex);
+                                if (match) {
+                                    isChapter = true;
+                                    let index = url.indexOf(match[0]);
+                                    storyUrl = url.substring(0, index);
+                                } else {
+                                    if (url.includes('/truyen/') || url.includes('/story/')) {
+                                        storyUrl = url;
+                                    }
+                                }
+                            }
+                            if (storyUrl) {
+                                storyUrl = storyUrl.replace(/\/$/, "");
+                            }
+                            
+                            let storyName = getCleanStoryName();
+                            if (!storyName) {
+                                return; // Đợi trang thật tải xong
+                            }
+                            
+                            if (isChapter && !chapterName) {
+                                let headings = document.querySelectorAll('h1, h2, h3, .chapter-title, .title-chapter');
+                                for (let h of headings) {
+                                    let txt = h.innerText ? h.innerText.trim() : "";
+                                    if (/^(chương|chapter|chap|tập|c)\s+\d+/i.test(txt)) {
+                                        chapterName = txt;
+                                        break;
+                                    }
+                                }
+                                if (!chapterName) {
+                                    let title = document.title || "";
+                                    let m = title.match(/(chương|chapter|chap|tập|c)\s+\d+([^\-|\|]*)/i);
+                                    chapterName = m ? m[0].trim() : "";
+                                }
+                            }
+                            
+                            if (isChapter && !chapterName) {
+                                return; // Đợi tên chương load xong
+                            }
+                            
+                            if (url !== lastProcessedUrl) {
+                                console.log("[HistoryJS] Xu ly URL moi: " + url + " | Ten truyen: " + storyName);
+                                lastProcessedUrl = url;
+                                
+                                if (isChapter && chapterName) {
+                                    console.log("[HistoryJS] Luu lich su cho: " + storyName + " - " + chapterName);
+                                    if (window.AndroidTTS && window.AndroidTTS.saveHistory) {
+                                        window.AndroidTTS.saveHistory(storyUrl, storyName, chapterName, url);
+                                    }
+                                } else if (!isChapter) {
+                                    let isBackNavigation = false;
+                                    try {
+                                        let navs = performance.getEntriesByType("navigation");
+                                        if (navs && navs.length > 0) {
+                                            isBackNavigation = (navs[0].type === "back_forward");
+                                        } else if (window.performance && window.performance.navigation) {
+                                            isBackNavigation = (window.performance.navigation.type === window.performance.navigation.TYPE_BACK_FORWARD);
+                                        }
+                                    } catch(e) {}
+                                    
+                                    console.log("[HistoryJS] Kiem tra tu dong chuyen huong cho truyen: " + storyName + " | isBackNavigation: " + isBackNavigation);
+                                    
+                                    if (!isBackNavigation && window.AndroidTTS && window.AndroidTTS.getSavedChapterUrl) {
+                                        let savedUrl = window.AndroidTTS.getSavedChapterUrl(storyUrl, storyName);
+                                        console.log("[HistoryJS] savedUrl tu Android: " + savedUrl);
+                                        if (savedUrl && savedUrl !== url) {
+                                            console.log("[HistoryJS] Thuc hien chuyen huong den: " + savedUrl);
+                                            window.location.href = savedUrl;
+                                        }
+                                    }
+                                }
+                            }
+                        } catch(e) {
+                            console.error("[HistoryJS] Loi xu ly lich su:", e);
+                        }
+                    }
+                    
+                    // Chạy định kỳ mỗi 1.5 giây để xử lý SPA client-side navigation và race conditions
+                    setInterval(processHistory, 1500);
+                    setTimeout(processHistory, 500);
+                    setInterval(function() {
+                        console.log("[TestJS] Current URL: " + window.location.href + " | Title: " + document.title + " | Injected: " + window.historyJSInjected);
+                    }, 2000);
+                    window.historyJSInjected = true;
+                })();
+                // --- KẾT THÚC: LƯU VÀ PHỤC HỒI LỊCH SỬ ---
+            })();
+        """.trimIndent()
+        view?.post {
+            view.evaluateJavascript(js, null)
+        }
+    }
+
     AndroidView(
         factory = { context ->
             WebView(context).apply {
@@ -368,334 +838,26 @@ fun WebViewScreen(url: String, activity: MainActivity, onUrlChanged: (String) ->
                         super.doUpdateVisitedHistory(view, url, isReload)
                         url?.let { onUrlChanged(it) }
                         onNavStateChanged(canGoBack(), canGoForward())
+                        // Inject on URL update (client-side/SPA navigation)
+                        injectHistoryJS(view)
                     }
 
                     override fun onPageFinished(view: WebView?, url: String?) {
                         super.onPageFinished(view, url)
+                        android.util.Log.d("AndroidTTS", "onPageFinished: url=$url")
                         onNavStateChanged(canGoBack(), canGoForward())
-                        val js = """
-                            javascript:(function() {
-                                let style = document.createElement("style");
-                                style.innerHTML = ".tts-highlight { background-color: #ffff99 !important; color: black !important; border-radius: 4px; } .tts-clickable { cursor: pointer; }";
-                                document.head.appendChild(style);
-
-                                window.startTTSReading = function() {
-                                    function findMainContentContainer() {
-                                        let current = document.body;
-                                        while (current) {
-                                            let maxChild = null;
-                                            let maxLen = 0;
-                                            for (let i = 0; i < current.children.length; i++) {
-                                                let child = current.children[i];
-                                                let len = child.innerText ? child.innerText.length : 0;
-                                                if (len > maxLen) {
-                                                    maxLen = len;
-                                                    maxChild = child;
-                                                }
-                                            }
-                                            let parentLen = current.innerText ? current.innerText.length : 0;
-                                            if (maxChild && maxLen > parentLen * 0.8 && maxLen > 500) {
-                                                current = maxChild;
-                                            } else {
-                                                return current;
-                                            }
-                                        }
-                                        return document.body;
-                                    }
-
-                                    let contentDiv = findMainContentContainer();
-                                    
-                                    if (contentDiv) {
-                                        // Wrap loose text nodes
-                                        let childNodes = Array.from(contentDiv.childNodes);
-                                        for (let i = 0; i < childNodes.length; i++) {
-                                            let node = childNodes[i];
-                                            if (node.nodeType === Node.TEXT_NODE) {
-                                                let text = node.textContent.trim();
-                                                if (text.length > 10) {
-                                                    let span = document.createElement("span");
-                                                    span.textContent = text;
-                                                    span.style.display = "block";
-                                                    contentDiv.insertBefore(span, node);
-                                                    contentDiv.removeChild(node);
-                                                }
-                                            }
-                                        }
-
-                                        let elements = contentDiv.children;
-                                        let textArr = [];
-                                        let pIndex = 0;
-                                        
-                                        for (let i = 0; i < elements.length; i++) {
-                                            let el = elements[i];
-                                            let text = el.innerText ? el.innerText.trim() : "";
-                                            // Ignore nav/header elements
-                                            if (el.tagName === "NAV" || el.tagName === "HEADER" || el.tagName === "SCRIPT" || el.tagName === "STYLE" || el.tagName === "A" || el.tagName === "BUTTON") continue;
-                                            
-                                            if (text.length > 15) {
-                                                textArr.push(text + ". ");
-                                                
-                                                if (!el.classList.contains("tts-clickable")) {
-                                                    el.classList.add("tts-clickable");
-                                                    el.setAttribute("data-tts-index", pIndex);
-                                                    let clickHandler = function(e) {
-                                                        AndroidTTS.playFromIndex(parseInt(this.getAttribute("data-tts-index")));
-                                                        e.stopPropagation();
-                                                    };
-                                                    el.addEventListener("click", clickHandler, true);
-                                                    el.addEventListener("touchend", clickHandler, true);
-                                                }
-                                                pIndex++;
-                                            }
-                                        }
-                                        
-                                        if (textArr.length > 0) {
-                                            AndroidTTS.receiveParagraphs(JSON.stringify(textArr));
-                                        }
-                                    }
-                                };
-
-                                window.highlightParagraph = function(index) {
-                                    let els = document.querySelectorAll(".tts-highlight");
-                                    for (let i=0; i<els.length; i++) {
-                                        els[i].classList.remove("tts-highlight");
-                                    }
-                                    
-                                    let target = document.querySelector('[data-tts-index="' + index + '"]');
-                                    if (target) {
-                                        target.classList.add("tts-highlight");
-                                        target.scrollIntoView({ behavior: "smooth", block: "center" });
-                                    }
-                                };
-
-                                window.goToNextChapterAndRead = function() {
-                                    let els = document.querySelectorAll("a, button, div.btn, span.btn, .next");
-                                    let candidates = [];
-                                    for(let i=0; i<els.length; i++) {
-                                        let el = els[i];
-                                        let txt = el.innerText ? el.innerText.trim().toLowerCase() : "";
-                                        let className = typeof el.className === "string" ? el.className.toLowerCase() : "";
-                                        
-                                        let isNext = false;
-                                        if (txt === "chương sau" || txt === "chương tiếp" || txt === "next" || txt === "chương sau >" || txt.includes("chương sau") || txt.includes("chương tiếp")) {
-                                            isNext = true;
-                                        }
-                                        
-                                        if (txt === ">" || txt === ">>" || txt === "›" || txt === "»" || txt === "→") {
-                                            let offsetTop = el.getBoundingClientRect().top + window.scrollY;
-                                            if (offsetTop > 500 || className.includes("next") || className.includes("btn")) {
-                                                isNext = true;
-                                            }
-                                        }
-                                        
-                                        if (className.includes("next") && !className.includes("prev")) {
-                                            isNext = true;
-                                        }
-                                        
-                                        if (isNext) candidates.push(el);
-                                    }
-                                    
-                                    candidates.sort((a, b) => {
-                                        return (b.getBoundingClientRect().top + window.scrollY) - (a.getBoundingClientRect().top + window.scrollY);
-                                    });
-                                    
-                                    let nextBtn = candidates[0];
-
-                                    if (nextBtn) {
-                                        let oldText = document.body.innerText;
-                                        if (nextBtn.href && nextBtn.href.startsWith("http")) {
-                                            window.location.href = nextBtn.href;
-                                        } else {
-                                            nextBtn.click();
-                                        }
-                                        
-                                        let attempts = 0;
-                                        let checkInterval = setInterval(function() {
-                                            attempts++;
-                                            if (document.body.innerText !== oldText || attempts > 20) {
-                                                clearInterval(checkInterval);
-                                                setTimeout(() => window.startTTSReading(), 1500);
-                                            }
-                                        }, 500);
-                                    } else {
-                                        // Fallback: Auto-increment the last number in the URL
-                                        let url = window.location.href;
-                                        try {
-                                            let urlObj = new URL(url);
-                                            let path = urlObj.pathname;
-                                            let match = path.match(/(\d+)(?!.*\d)/);
-                                            if (match) {
-                                                let oldNumStr = match[1];
-                                                let newNum = parseInt(oldNumStr) + 1;
-                                                let newPath = path.substring(0, match.index) + newNum + path.substring(match.index + oldNumStr.length);
-                                                urlObj.pathname = newPath;
-                                                window.location.href = urlObj.toString();
-                                                
-                                                let oldText = document.body.innerText;
-                                                let attempts = 0;
-                                                let checkInterval = setInterval(function() {
-                                                    attempts++;
-                                                    if (document.body.innerText !== oldText || attempts > 20) {
-                                                        clearInterval(checkInterval);
-                                                        setTimeout(() => window.startTTSReading(), 1500);
-                                                    }
-                                                }, 500);
-                                            } else {
-                                                AndroidTTS.notifyNoNextChapter();
-                                            }
-                                        } catch(e) {
-                                            // Ignore
-                                        }
-                                    }
-                                };
-                                
-                                // --- BẮT ĐẦU: TỰ ĐỘNG HÓA WEB PLAYER ---
-                                window.webPlayerTransitioning = false;
-                                window.playerStatusContainer = null;
-                                let userDelayMs = 2000;
-
-                                function nativeClick(el) {
-                                    let rect = el.getBoundingClientRect();
-                                    let x = rect.left + rect.width / 2;
-                                    let y = rect.top + rect.height / 2;
-                                    if (window.AndroidTTS && window.AndroidTTS.simulateClick) {
-                                        window.AndroidTTS.simulateClick(x, y);
-                                    } else {
-                                        el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-                                        if (el.parentElement) el.parentElement.click();
-                                    }
-                                }
-
-                                setInterval(function() {
-                                    if (window.webPlayerTransitioning) return;
-                                    
-                                    if (!window.playerStatusContainer || !document.body.contains(window.playerStatusContainer)) {
-                                        let walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
-                                        let node;
-                                        while (node = walker.nextNode()) {
-                                            if (node.nodeValue.match(/Đoạn\s*\d+\s*\/\s*\d+/i) || node.nodeValue === 'Kết thúc' || node.nodeValue === 'Tạm dừng') {
-                                                let parentText = node.parentElement.innerText || "";
-                                                if (parentText.includes('Đoạn') || parentText.includes('Kết thúc') || parentText.includes('Tạm dừng')) {
-                                                    window.playerStatusContainer = node.parentElement;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    
-                                    let autoplayStep = localStorage.getItem('sitruyen_autoplay_step');
-                                    
-                                    if (autoplayStep === 'open_player') {
-                                        let stickyDiv = document.querySelector('div.sticky.top-0.z-50');
-                                        if (stickyDiv) {
-                                            let svgs = stickyDiv.querySelectorAll('svg');
-                                            if (svgs.length >= 3) {
-                                                nativeClick(svgs[2]);
-                                                localStorage.setItem('sitruyen_autoplay_step', 'click_play');
-                                            }
-                                        }
-                                    } else if (autoplayStep === 'click_play') {
-                                        if (window.playerStatusContainer) {
-                                            let statusText = window.playerStatusContainer.innerText || "";
-                                            if (statusText.includes("Tạm dừng")) {
-                                                let container = window.playerStatusContainer.parentElement;
-                                                for(let i=0; i<6; i++) {
-                                                    if(!container) break;
-                                                    let svgs = container.querySelectorAll('svg');
-                                                    if(svgs.length >= 3) {
-                                                        let targetSvg = svgs[2] || svgs[1];
-                                                        if (targetSvg) {
-                                                            nativeClick(targetSvg);
-                                                            localStorage.removeItem('sitruyen_autoplay_step');
-                                                        }
-                                                        break;
-                                                    }
-                                                    container = container.parentElement;
-                                                }
-                                            } else if (statusText.includes("Đang đọc") || statusText.includes("Đoạn")) {
-                                                // Already playing or preparing
-                                                localStorage.removeItem('sitruyen_autoplay_step');
-                                            }
-                                        }
-                                    }
-                                    
-                                    if (window.playerStatusContainer) {
-                                        let statusText = window.playerStatusContainer.innerText || "";
-                                        let isPaused = statusText.includes("Tạm dừng");
-                                        let isFinished = statusText.includes("Kết thúc");
-                                        
-                                        let m = statusText.match(/Đoạn\s*(\d+)\s*\/\s*(\d+)/i);
-                                        if (m) {
-                                            let current = parseInt(m[1]);
-                                            let total = parseInt(m[2]);
-                                            if (current === total && total > 0 && isPaused) {
-                                                isFinished = true;
-                                            }
-                                        }
-                                        
-                                        if (isFinished) {
-                                            window.webPlayerTransitioning = true;
-                                            setTimeout(function() {
-                                                localStorage.setItem('sitruyen_autoplay_step', 'open_player');
-                                                if (window.goToNextChapterAndRead) {
-                                                    window.goToNextChapterAndRead();
-                                                }
-                                            }, userDelayMs);
-                                        }
-                                    }
-                                }, 1000);
-                                // --- KẾT THÚC: TỰ ĐỘNG HÓA WEB PLAYER ---
-                                // --- BẮT ĐẦU: LƯU LỊCH SỬ ---
-                                setTimeout(function() {
-                                    try {
-                                        let url = window.location.href;
-                                        if (url.includes('/read/')) {
-                                            // Extract storyId
-                                            let m = url.match(/\/read\/(\d+)/);
-                                            let storyId = m ? m[1] : "";
-                                            
-                                            // Extract chapter name (usually in h1 or h2 with class text-2xl or similar, containing "Chương")
-                                            let chapterName = "";
-                                            let headings = document.querySelectorAll('h1, h2, h3');
-                                            for(let h of headings) {
-                                                if (h.innerText && h.innerText.toLowerCase().includes('chương')) {
-                                                    chapterName = h.innerText.trim();
-                                                    break;
-                                                }
-                                            }
-                                            
-                                            // Extract story name (usually in breadcrumb or <title>)
-                                            let storyName = "";
-                                            let title = document.title || "";
-                                            // "Chương 3: ... - Tên Truyện"
-                                            if (title.includes('-')) {
-                                                let parts = title.split('-');
-                                                storyName = parts[parts.length - 1].trim();
-                                            }
-                                            // Try breadcrumb
-                                            let as = document.querySelectorAll('a');
-                                            for(let a of as) {
-                                                if (a.href && a.href.includes('/truyen/') && a.innerText) {
-                                                    storyName = a.innerText.trim();
-                                                    break;
-                                                }
-                                            }
-                                            
-                                            if (storyId && storyName && chapterName) {
-                                                if (window.AndroidTTS && window.AndroidTTS.saveHistory) {
-                                                    window.AndroidTTS.saveHistory(storyId, storyName, chapterName, url);
-                                                }
-                                            }
-                                        }
-                                    } catch(e) {}
-                                }, 3000); // Đợi 3s cho web load xong
-                                // --- KẾT THÚC: LƯU LỊCH SỬ ---
-                            })();
-                        """.trimIndent()
-                        view?.evaluateJavascript(js, null)
+                        injectHistoryJS(view)
                     }
                 }
-                webChromeClient = WebChromeClient()
+                webChromeClient = object : WebChromeClient() {
+                    override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                        super.onProgressChanged(view, newProgress)
+                        // Inject as early as 80% progress is loaded
+                        if (newProgress >= 80) {
+                            injectHistoryJS(view)
+                        }
+                    }
+                }
                 loadUrl(url)
             }
         },
